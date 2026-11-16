@@ -16,9 +16,18 @@ from pathlib import Path
 from typing import Any
 
 
-MODEL_NAME = "deepseek-v4-flash"
+MODEL_NAME = "DeepSeek-V4.1-Flash-1017"
+DEFAULT_API_BASE_URL = "https://www.moyu.cn/v1"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+JUDGMENT_LENSES = (
+    "Inductive: look for a consistent pattern across the supplied measures and evidence.",
+    "Abductive and causal: assess whether recent product commercialization plausibly reflects effective R&D, without claiming causation from correlation alone.",
+    "Analogical: compare the company with its industry benchmark and consider how strong or weak the difference is in context.",
+    "Probabilistic: weigh evidence quality, consistency, and proximity to the benchmark; express uncertainty in the rationale.",
+    "Counterfactual: consider whether a modest change in the supplied evidence would change the conclusion, without performing new arithmetic.",
+)
+MIN_VALID_JUDGMENTS = len(JUDGMENT_LENSES) // 2 + 1
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -214,13 +223,20 @@ def build_agent() -> Any:
         from langchain_deepseek import ChatDeepSeek
         from langchain.agents import create_agent
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
+    Use the DeepSeek model named by ``MODEL_NAME``. The API key and optional
+    ``DEEPSEEK_BASE_URL`` are loaded from .env. Each company has its own tools
+    (see ``analyze_companies``), so create one tool-calling agent per company.
     """
+    import os
+
     from langchain_deepseek import ChatDeepSeek
 
-    return ChatDeepSeek(model=MODEL_NAME, temperature=0)
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE_URL),
+        max_retries=5,
+    )
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -309,35 +325,51 @@ company facts from memory or invent values.
 Rules:
 - Point 1 PASS only when 2023-to-2025 revenue growth is greater than the company's
   industry median revenue_growth_2y_pct.
-- Point 3 PASS only when 2025 sales of products launched in 2024 or 2025 divided
-  by FY2025 R&D spending is greater than the industry's new_product_sales_per_rd.
+- For point 3, calculate FY2025 sales of products launched in 2023-2025 divided
+  by FY2025 R&D spending and compare the result with the industry's
+  new_product_sales_per_rd median. Do not apply a fixed multiplier or produce a
+  PASS/FAIL verdict for point 3; return the calculation and evidence for independent
+  reviewers.
 - All monetary amounts are USD thousands. Use SQL to retrieve the raw values, then
   write Python code and call python_calculator with those values in its JSON `data`
-  argument. The code must calculate the ratios and set a `result` variable. Do not
-  do arithmetic mentally. Do not give a verdict before the calculator returns.
+  argument. The code must calculate the ratio and its relation to the median and set
+  a `result` variable. Do not do arithmetic mentally or give a verdict before the
+  calculator returns.
 - Use one aggregate SQL query for each point, including the relevant industry median.
 - Treat SQL or calculation errors as errors; never guess missing values.
 
-Return a compact JSON object with `points` keyed by "1" and "3"; each value has
-`verdict` (PASS or FAIL), `calculation` (the calculated comparison), and `evidence`
-(the SQL fields used)."""
+Return a compact JSON object with `points` keyed by "1" and "3". Point 1 must
+include `verdict`, `python_code`, `calculation`, and `evidence`. Point 3 must
+include `python_code`, the calculator's numeric `calculation`, and `evidence`,
+but no verdict. Do not calculate or round values in your prose."""
     interviewer_prompt = """You are the scuttlebutt interviewer. Use the interview tool exactly
 once with role `current_employee` and topic `working_conditions`. This source is
-for Fisher point 7. Report the answer faithfully. Point 7 is PASS only if the
-answer explicitly describes positive, outstanding labor/personnel relations;
-reporting complaints or poor relations means FAIL. Do not invent evidence or
-conduct another interview."""
-    integrator_prompt = f"""You integrate specialist research for Fisher's investment framework.
-Use only the quantitative analyst's calculated findings for points 1 and 3 and the
-interviewer's evidence for point 7. Do not override a calculated comparison or invent
-facts. For point 7, PASS only when the interview explicitly describes positive,
-outstanding labor/personnel relations; otherwise return FAIL.
+for Fisher point 7. Report the answer faithfully. PASS when the answer gives
+specific positive evidence about employee relations, such as fair pay, people
+staying for years or low turnover, a good workplace, or concerns being fixed.
+Do not require the interviewee to use the word "outstanding". FAIL when the
+answer reports clear problems such as constant overtime, frequent departures,
+low morale, or strike threats, or gives no positive evidence. Do not invent
+evidence or conduct another interview."""
+    reviewer_prompt = """You are an independent reviewer applying Philip Fisher's framework.
+Judge points 1, 3, and 7 only from the supplied analyst calculations and interview.
+Do not invent facts, access outside data, or do arithmetic. Apply point 1's stated
+industry-median rule exactly. For point 3, there is no fixed multiplier or numeric
+cutoff: use the calculated new-product-sales-per-R&D ratio, its relation to the
+industry median, and the strength and limitations of the supplied evidence. Consider
+the assigned reasoning lens, but return only a concise evidence-based rationale, not
+private chain-of-thought. For point 7, PASS when the interview gives specific positive
+employee-relations evidence (such as fair pay, low turnover, a good workplace, or
+concerns being addressed); FAIL for clear negative evidence or no positive evidence.
 
-Return only JSON, no markdown, in this exact shape:
-{{"points": {{"1": "PASS or FAIL", "3": "PASS or FAIL", "7": "PASS or FAIL"}},
- "summary": "Two concise sentences explaining the three verdicts."}}"""
+Return only JSON in this shape:
+{"points": {
+  "1": {"verdict": "PASS or FAIL", "rationale": "one concise evidence-based sentence"},
+  "3": {"verdict": "PASS or FAIL", "rationale": "one concise evidence-based sentence"},
+  "7": {"verdict": "PASS or FAIL", "rationale": "one concise evidence-based sentence"}
+}}"""
 
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(2)
 
     async def analyze_one(name: str) -> dict[str, Any]:
         try:
@@ -354,39 +386,70 @@ Return only JSON, no markdown, in this exact shape:
                 tools=[interview_tool],
                 system_prompt=interviewer_prompt,
             )
+            reviewer = create_agent(
+                model=agent,
+                tools=[],
+                system_prompt=reviewer_prompt,
+            )
             async with semaphore:
                 analyst_result, interview_result = await asyncio.gather(
                     invoke(
                         analyst,
                         f"""Research folder `{name}`. For point 1, query total 2023 and
 2025 orders revenue and this company's industry's revenue_growth_2y_pct.
-For point 3, query FY2025 sales for products launched in 2024-2025, FY2025
+For point 3, query FY2025 sales for products launched in 2023-2025, FY2025
 research_development spending, and the industry's new_product_sales_per_rd.
 Use the SQL and Python tools as required by your instructions, then return your
-JSON findings.""",
+JSON findings. For point 3, report the ratio and comparison only, not a verdict.""",
                     ),
                     invoke(interviewer, f"Conduct the point 7 interview for `{name}`."),
                 )
-                integrator = create_agent(
-                    model=agent,
-                    tools=[],
-                    system_prompt=integrator_prompt,
-                )
-                integrated = parse_json_object(await invoke(
-                    integrator,
-                    f"""Company folder: {name}
+                judgment_results = []
+                judgment_errors = []
+                for lens in JUDGMENT_LENSES:
+                    try:
+                        raw_judgment = parse_json_object(await invoke(
+                            reviewer,
+                            f"""Reasoning lens for this independent judgment:
+{lens}
+
+Company folder: {name}
 Quantitative analyst findings:
 {analyst_result}
 
 Interviewer findings:
 {interview_result}""",
-                ))
-            points = normalize_points(integrated.get("points"), chosen)
-            if any(verdict is None for verdict in points.values()):
-                raise ValueError("Integrator did not return valid verdicts for all chosen points.")
+                        ))
+                        judgment_results.append(
+                            normalize_judgment(raw_judgment, chosen)
+                        )
+                    except Exception as exc:
+                        judgment_errors.append(type(exc).__name__)
+
+                if len(judgment_results) < MIN_VALID_JUDGMENTS:
+                    details = ", ".join(judgment_errors) or "insufficient valid judgments"
+                    raise RuntimeError(
+                        f"Only {len(judgment_results)}/{len(JUDGMENT_LENSES)} valid "
+                        f"judgments; need {MIN_VALID_JUDGMENTS}. Errors: {details}."
+                    )
+
+                points, vote_metrics = aggregate_judgments(judgment_results, chosen)
+                summary_parts = [
+                    f"Point {point}: {points[point]} "
+                    f"({vote_metrics[point]['winning_votes']}/"
+                    f"{vote_metrics[point]['valid_votes']} votes); "
+                    f"{vote_metrics[point]['rationale']}"
+                    for point in chosen
+                ]
+                summary = " ".join(summary_parts)
+                if judgment_errors:
+                    summary += (
+                        f" Ensemble used {len(judgment_results)}/{len(JUDGMENT_LENSES)} "
+                        "valid judgments; some generations failed."
+                    )
             return {
                 "points": points,
-                "summary": str(integrated.get("summary", "")).strip(),
+                "summary": summary,
             }
         except Exception as exc:
             return {
@@ -397,44 +460,90 @@ Interviewer findings:
     results = await asyncio.gather(*(analyze_one(name) for name in companies))
     analyses = dict(zip(companies, results))
 
-    selector = create_agent(
-        model=agent,
-        tools=[],
-        system_prompt="""You are the portfolio stock selector. Select one company folder as
-the strongest candidate based on the supplied Fisher verdicts and evidence. Prefer
-more PASS verdicts; use the evidence to break ties. Select only from the supplied
-folder names. Return only JSON: {"selected_company": "exact folder name",
-"reason": "one concise sentence"}.""",
-    )
-    selection_error = ""
-    try:
-        selection = parse_json_object(await invoke(
-            selector,
-            "Select one target from these completed company analyses:\n"
-            + json.dumps(
-                {
-                    name: {
-                        "points": result["points"],
-                        "summary": result["summary"],
-                    }
-                    for name, result in analyses.items()
-                },
-                ensure_ascii=True,
-            ),
-        ))
-        selected = selection.get("selected_company")
-        if selected not in analyses:
-            raise ValueError(f"Selector returned an unknown company: {selected!r}.")
-        reason = str(selection.get("reason", "")).strip()
+    if analyses:
+        selected, score = select_portfolio_target(analyses, chosen)
         analyses[selected]["summary"] += (
-            f" Portfolio selection: selected as the target. {reason}"
+            " Portfolio selection: selected by the Python rule with "
+            f"{score[0]}/{len(chosen)} PASS verdicts; ties favor more valid verdicts, "
+            "then PASS on points 1 and 3, then the alphabetically first folder."
         )
-    except Exception as exc:
-        selection_error = f"Portfolio selection failed: {type(exc).__name__}: {exc}"
-        for result in analyses.values():
-            result["summary"] += f" {selection_error}"
 
     return analyses
+
+
+def normalize_judgment(
+    judgment: dict[str, Any], chosen: list[int]
+) -> dict[int, dict[str, str]]:
+    """Validate one review's verdicts and concise evidence rationales."""
+    raw_points = judgment.get("points")
+    if not isinstance(raw_points, dict):
+        raise ValueError("Reviewer response must contain a points object.")
+
+    normalized: dict[int, dict[str, str]] = {}
+    for point in chosen:
+        entry = raw_points.get(str(point), raw_points.get(point))
+        if not isinstance(entry, dict):
+            raise ValueError(f"Reviewer omitted point {point}.")
+        verdict = normalize_verdict(entry.get("verdict"))
+        rationale = str(entry.get("rationale", "")).strip()
+        if verdict is None or not rationale:
+            raise ValueError(f"Reviewer returned an invalid point {point} judgment.")
+        normalized[point] = {"verdict": verdict, "rationale": rationale}
+    return normalized
+
+
+def aggregate_judgments(
+    judgments: list[dict[int, dict[str, str]]], chosen: list[int]
+) -> tuple[dict[int, str], dict[int, dict[str, Any]]]:
+    """Aggregate independent verdicts by majority and report vote consensus."""
+    if len(judgments) < MIN_VALID_JUDGMENTS:
+        raise ValueError(
+            f"Need at least {MIN_VALID_JUDGMENTS} valid judgments; got {len(judgments)}."
+        )
+
+    verdicts: dict[int, str] = {}
+    metrics: dict[int, dict[str, Any]] = {}
+    for point in chosen:
+        counts = {
+            verdict: sum(judgment[point]["verdict"] == verdict for judgment in judgments)
+            for verdict in VERDICTS
+        }
+        if counts["PASS"] == counts["FAIL"]:
+            raise ValueError(f"Reviewer votes are tied for point {point}.")
+        winner = max(VERDICTS, key=counts.__getitem__)
+        rationale = next(
+            judgment[point]["rationale"]
+            for judgment in judgments
+            if judgment[point]["verdict"] == winner
+        )
+        verdicts[point] = winner
+        metrics[point] = {
+            "winning_votes": counts[winner],
+            "valid_votes": len(judgments),
+            "rationale": rationale,
+        }
+    return verdicts, metrics
+
+
+def select_portfolio_target(
+    analyses: dict[str, dict[str, Any]], chosen: list[int]
+) -> tuple[str, tuple[int, int, int]]:
+    """Select by PASS count, evidence completeness, and financial-point PASSes."""
+    if not analyses:
+        raise ValueError("Cannot select a portfolio target without company analyses.")
+
+    def score(name: str) -> tuple[int, int, int]:
+        entry = analyses[name]
+        points = normalize_points(entry.get("points"), chosen)
+        pass_count = sum(verdict == "PASS" for verdict in points.values())
+        valid_count = sum(verdict in VERDICTS for verdict in points.values())
+        financial_passes = sum(
+            points.get(point) == "PASS" for point in (1, 3) if point in chosen
+        )
+        return pass_count, valid_count, financial_passes
+
+    selected = min(analyses, key=lambda name: (*(-value for value in score(name)), name))
+    return selected, score(selected)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
