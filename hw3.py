@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import csv
 import json
+import math
 import sqlite3
 import threading
 import zlib
@@ -57,7 +59,152 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 3, 7]
+
+
+def _run_python_calculation(code: str, raw_data: str) -> str:
+    """Evaluate small Python expressions over JSON data without executing code."""
+    if len(code) > 4000:
+        raise ValueError("Python calculation is too long (maximum 4000 characters).")
+    if len(raw_data) > 20000:
+        raise ValueError("Calculation input is too long (maximum 20000 characters).")
+
+    tree = ast.parse(code, mode="exec")
+    allowed_nodes = (
+        ast.Module, ast.Assign, ast.Expr, ast.Name, ast.Load, ast.Store,
+        ast.Constant, ast.Dict, ast.List, ast.Tuple, ast.Subscript, ast.BinOp,
+        ast.UnaryOp, ast.Compare, ast.BoolOp, ast.IfExp, ast.Call,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.UAdd,
+        ast.USub, ast.Not, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.And, ast.Or,
+    )
+    functions = {"round": round, "sum": sum, "min": min, "max": max, "abs": abs, "len": len}
+    assigned_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError(f"Unsupported Python syntax: {type(node).__name__}.")
+        if isinstance(node, ast.Assign) and (
+            len(node.targets) != 1
+            or not isinstance(node.targets[0], ast.Name)
+        ):
+            raise ValueError("Only single-variable assignments are allowed.")
+        if isinstance(node, ast.Assign):
+            assigned_names.update(target.id for target in node.targets)
+        if isinstance(node, ast.Call) and (
+            not isinstance(node.func, ast.Name)
+            or node.func.id not in functions
+            or node.keywords
+        ):
+            raise ValueError("Only positional calls to round, sum, min, max, abs, and len are allowed.")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) > 1000:
+            raise ValueError("String literals in calculations are limited to 1000 characters.")
+
+    data = json.loads(raw_data)
+    if not isinstance(data, dict) or any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in data.values()
+    ):
+        raise ValueError("Calculation input must be a JSON object with numeric values.")
+    if assigned_names & ({"data"} | functions.keys()):
+        raise ValueError("Calculations cannot overwrite input data or calculator functions.")
+
+    variables: dict[str, Any] = {"data": data, **functions}
+    variables.update({name: None for name in assigned_names})
+    allowed_names = set(variables)
+
+    def evaluate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)) and not isinstance(node.value, bool) and abs(node.value) > 1_000_000_000:
+                raise ValueError("Numeric literals must be between -1e9 and 1e9.")
+            if not isinstance(node.value, (int, float, str, bool, type(None))):
+                raise ValueError("Unsupported literal type.")
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id.startswith("_") or node.id not in allowed_names:
+                raise ValueError(f"Name is not allowed in calculations: {node.id}.")
+            return variables[node.id]
+        if isinstance(node, ast.Dict):
+            if len(node.keys) > 100:
+                raise ValueError("Calculation dictionaries are limited to 100 entries.")
+            return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values)}
+        if isinstance(node, (ast.List, ast.Tuple)):
+            if len(node.elts) > 100:
+                raise ValueError("Calculation sequences are limited to 100 entries.")
+            values = [evaluate(item) for item in node.elts]
+            return values if isinstance(node, ast.List) else tuple(values)
+        if isinstance(node, ast.Subscript):
+            container, key = evaluate(node.value), evaluate(node.slice)
+            if not isinstance(container, (dict, list, tuple)):
+                raise ValueError("Subscript access is limited to JSON containers.")
+            return container[key]
+        if isinstance(node, ast.BinOp):
+            left, right = evaluate(node.left), evaluate(node.right)
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (left, right)):
+                raise ValueError("Arithmetic operators require numeric values.")
+            operations = {
+                ast.Add: lambda a, b: a + b,
+                ast.Sub: lambda a, b: a - b,
+                ast.Mult: lambda a, b: a * b,
+                ast.Div: lambda a, b: a / b,
+                ast.FloorDiv: lambda a, b: a // b,
+                ast.Mod: lambda a, b: a % b,
+            }
+            value = operations[type(node.op)](left, right)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("Calculation produced a non-finite number.")
+            if abs(value) > 1e15:
+                raise ValueError("Calculation result exceeds the numeric limit.")
+            return value
+        if isinstance(node, ast.UnaryOp):
+            operand = evaluate(node.operand)
+            if isinstance(node.op, ast.Not):
+                return not operand
+            if isinstance(operand, bool) or not isinstance(operand, (int, float)):
+                raise ValueError("Unary arithmetic requires a numeric value.")
+            return +operand if isinstance(node.op, ast.UAdd) else -operand
+        if isinstance(node, ast.Compare):
+            left = evaluate(node.left)
+            for operation, comparator in zip(node.ops, node.comparators):
+                right = evaluate(comparator)
+                comparisons = {
+                    ast.Eq: lambda a, b: a == b,
+                    ast.NotEq: lambda a, b: a != b,
+                    ast.Lt: lambda a, b: a < b,
+                    ast.LtE: lambda a, b: a <= b,
+                    ast.Gt: lambda a, b: a > b,
+                    ast.GtE: lambda a, b: a >= b,
+                }
+                if not comparisons[type(operation)](left, right):
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.BoolOp):
+            values = (evaluate(value) for value in node.values)
+            if isinstance(node.op, ast.And):
+                return all(values)
+            return any(values)
+        if isinstance(node, ast.IfExp):
+            return evaluate(node.body if evaluate(node.test) else node.orelse)
+        if isinstance(node, ast.Call):
+            function = evaluate(node.func)
+            arguments = [evaluate(argument) for argument in node.args]
+            return function(*arguments)
+        raise ValueError(f"Unsupported expression: {type(node).__name__}.")
+
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            variables[statement.targets[0].id] = evaluate(statement.value)
+        elif isinstance(statement, ast.Expr):
+            evaluate(statement.value)
+        else:
+            raise ValueError(f"Unsupported statement: {type(statement).__name__}.")
+
+    if "result" not in variables or variables["result"] is None:
+        raise ValueError("Calculation must assign its final value to `result`.")
+    output = json.dumps(variables["result"], ensure_ascii=True)
+    if len(output) > 8000:
+        raise ValueError("Calculation result is too long (maximum 8000 characters).")
+    return output
 
 
 def build_agent() -> Any:
@@ -71,8 +218,9 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +256,185 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    from langchain.agents import create_agent
+    from langchain_core.tools import tool
+
+    chosen = check_chosen_points(CHOSEN_POINTS)
+    tools_by_name = {
+        name: {company_tool.name: company_tool for company_tool in company_tools}
+        for name, company_tools in companies.items()
+    }
+
+    @tool
+    def python_calculator(code: str, data: str) -> str:
+        """Run a restricted Python calculation over JSON data and return JSON."""
+        try:
+            return _run_python_calculation(code, data)
+        except (
+            ArithmeticError, IndexError, KeyError, RecursionError, SyntaxError,
+            TypeError, ValueError, json.JSONDecodeError,
+        ) as exc:
+            return f"Calculation error: {exc}"
+
+    async def invoke(runnable: Any, prompt: str) -> str:
+        response = await runnable.ainvoke({
+            "messages": [{"role": "user", "content": prompt}]
+        })
+        messages = response.get("messages", [])
+        if not messages:
+            raise RuntimeError("Agent returned no messages.")
+        content = messages[-1].content
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return "\n".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in content
+            ).strip()
+        return str(content).strip()
+
+    def parse_json_object(text: str) -> dict[str, Any]:
+        start = text.find("{")
+        if start < 0:
+            raise ValueError("Agent response did not contain a JSON object.")
+        result, _ = json.JSONDecoder().raw_decode(text[start:])
+        if not isinstance(result, dict):
+            raise ValueError("Agent response JSON must be an object.")
+        return result
+
+    analyst_prompt = f"""You are the quantitative analyst in a Fisher investment research team.
+Analyze only points 1 and 3 using SQL evidence and Python calculations. Do not infer
+company facts from memory or invent values.
+
+Rules:
+- Point 1 PASS only when 2023-to-2025 revenue growth is greater than the company's
+  industry median revenue_growth_2y_pct.
+- Point 3 PASS only when 2025 sales of products launched in 2024 or 2025 divided
+  by FY2025 R&D spending is greater than the industry's new_product_sales_per_rd.
+- All monetary amounts are USD thousands. Use SQL to retrieve the raw values, then
+  write Python code and call python_calculator with those values in its JSON `data`
+  argument. The code must calculate the ratios and set a `result` variable. Do not
+  do arithmetic mentally. Do not give a verdict before the calculator returns.
+- Use one aggregate SQL query for each point, including the relevant industry median.
+- Treat SQL or calculation errors as errors; never guess missing values.
+
+Return a compact JSON object with `points` keyed by "1" and "3"; each value has
+`verdict` (PASS or FAIL), `calculation` (the calculated comparison), and `evidence`
+(the SQL fields used)."""
+    interviewer_prompt = """You are the scuttlebutt interviewer. Use the interview tool exactly
+once with role `current_employee` and topic `working_conditions`. This source is
+for Fisher point 7. Report the answer faithfully. Point 7 is PASS only if the
+answer explicitly describes positive, outstanding labor/personnel relations;
+reporting complaints or poor relations means FAIL. Do not invent evidence or
+conduct another interview."""
+    integrator_prompt = f"""You integrate specialist research for Fisher's investment framework.
+Use only the quantitative analyst's calculated findings for points 1 and 3 and the
+interviewer's evidence for point 7. Do not override a calculated comparison or invent
+facts. For point 7, PASS only when the interview explicitly describes positive,
+outstanding labor/personnel relations; otherwise return FAIL.
+
+Return only JSON, no markdown, in this exact shape:
+{{"points": {{"1": "PASS or FAIL", "3": "PASS or FAIL", "7": "PASS or FAIL"}},
+ "summary": "Two concise sentences explaining the three verdicts."}}"""
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def analyze_one(name: str) -> dict[str, Any]:
+        try:
+            company_tools = tools_by_name[name]
+            sql_tool = company_tools["sql_query"]
+            interview_tool = company_tools["interview"]
+            analyst = create_agent(
+                model=agent,
+                tools=[sql_tool, python_calculator],
+                system_prompt=analyst_prompt,
+            )
+            interviewer = create_agent(
+                model=agent,
+                tools=[interview_tool],
+                system_prompt=interviewer_prompt,
+            )
+            async with semaphore:
+                analyst_result, interview_result = await asyncio.gather(
+                    invoke(
+                        analyst,
+                        f"""Research folder `{name}`. For point 1, query total 2023 and
+2025 orders revenue and this company's industry's revenue_growth_2y_pct.
+For point 3, query FY2025 sales for products launched in 2024-2025, FY2025
+research_development spending, and the industry's new_product_sales_per_rd.
+Use the SQL and Python tools as required by your instructions, then return your
+JSON findings.""",
+                    ),
+                    invoke(interviewer, f"Conduct the point 7 interview for `{name}`."),
+                )
+                integrator = create_agent(
+                    model=agent,
+                    tools=[],
+                    system_prompt=integrator_prompt,
+                )
+                integrated = parse_json_object(await invoke(
+                    integrator,
+                    f"""Company folder: {name}
+Quantitative analyst findings:
+{analyst_result}
+
+Interviewer findings:
+{interview_result}""",
+                ))
+            points = normalize_points(integrated.get("points"), chosen)
+            if any(verdict is None for verdict in points.values()):
+                raise ValueError("Integrator did not return valid verdicts for all chosen points.")
+            return {
+                "points": points,
+                "summary": str(integrated.get("summary", "")).strip(),
+            }
+        except Exception as exc:
+            return {
+                "points": {point: None for point in chosen},
+                "summary": f"Analysis failed: {type(exc).__name__}: {exc}",
+            }
+
+    results = await asyncio.gather(*(analyze_one(name) for name in companies))
+    analyses = dict(zip(companies, results))
+
+    selector = create_agent(
+        model=agent,
+        tools=[],
+        system_prompt="""You are the portfolio stock selector. Select one company folder as
+the strongest candidate based on the supplied Fisher verdicts and evidence. Prefer
+more PASS verdicts; use the evidence to break ties. Select only from the supplied
+folder names. Return only JSON: {"selected_company": "exact folder name",
+"reason": "one concise sentence"}.""",
+    )
+    selection_error = ""
+    try:
+        selection = parse_json_object(await invoke(
+            selector,
+            "Select one target from these completed company analyses:\n"
+            + json.dumps(
+                {
+                    name: {
+                        "points": result["points"],
+                        "summary": result["summary"],
+                    }
+                    for name, result in analyses.items()
+                },
+                ensure_ascii=True,
+            ),
+        ))
+        selected = selection.get("selected_company")
+        if selected not in analyses:
+            raise ValueError(f"Selector returned an unknown company: {selected!r}.")
+        reason = str(selection.get("reason", "")).strip()
+        analyses[selected]["summary"] += (
+            f" Portfolio selection: selected as the target. {reason}"
+        )
+    except Exception as exc:
+        selection_error = f"Portfolio selection failed: {type(exc).__name__}: {exc}"
+        for result in analyses.values():
+            result["summary"] += f" {selection_error}"
+
+    return analyses
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

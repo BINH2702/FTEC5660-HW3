@@ -142,6 +142,26 @@ answers, or a combination. Your code must read company data **only through
 the four tools**; do not open `company.db` or `interviews.dat` yourself. Do
 not hard-code folder names, company names or the public answers.
 
+### Multi-agent workflow
+
+The implementation uses specialist agents for the separate research steps:
+
+1. A quantitative analyst retrieves database evidence through `sql_query`,
+   writes a small Python calculation, and calls a restricted calculator tool
+   before reporting its findings.
+2. A scuttlebutt interviewer uses the interview tool for the chosen
+   interview-based point.
+3. An integrator combines the specialist evidence into the required verdicts
+   and short company summary.
+4. A portfolio selector compares the completed company analyses and selects
+   one target from the supplied company folders. The selected target is noted
+   in its results summary; all companies are still analyzed for grading.
+
+The analyst and interviewer work in parallel for each company, with a bounded
+number of companies processed concurrently. The calculator accepts only
+restricted Python expressions over JSON data and disallows imports and
+arbitrary function calls.
+
 ## Setup and public test
 
 ```bash
